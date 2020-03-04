@@ -67,16 +67,28 @@ class SoloHead(nn.Module):
                     conv_cfg=self.conv_cfg,
                     norm_cfg=self.norm_cfg,
                     bias=self.norm_cfg is None))
-            self.mask_convs.append(
-                ConvModule(
-                    chn,
-                    self.feat_channels,
-                    3,
-                    stride=1,
-                    padding=1,
-                    conv_cfg=self.conv_cfg,
-                    norm_cfg=self.norm_cfg,
-                    bias=self.norm_cfg is None))
+            if i == 0:
+                self.mask_convs.append(
+                    ConvModule(
+                        chn,
+                        self.feat_channels,
+                        3,
+                        stride=1,
+                        padding=1,
+                        conv_cfg=dict(type='CoordConv'),
+                        norm_cfg=self.norm_cfg,
+                        bias=self.norm_cfg is None))
+            else:
+                self.mask_convs.append(
+                    ConvModule(
+                        chn,
+                        self.feat_channels,
+                        3,
+                        stride=1,
+                        padding=1,
+                        conv_cfg=self.conv_cfg,
+                        norm_cfg=self.norm_cfg,
+                        bias=self.norm_cfg is None))
         self.solo_cls = nn.ModuleList([nn.Conv2d(
             self.feat_channels, self.cls_out_channels, 1, padding=0) for _ in self.grid_num])
         self.solo_mask = nn.ModuleList([nn.Conv2d(
@@ -85,11 +97,13 @@ class SoloHead(nn.Module):
         self.scales = nn.ModuleList([Scale(1.0) for _ in self.strides])
 
     def init_weights(self):
+        #ConvModule 已经有init了
+        '''
         for m in self.cls_convs:
             normal_init(m.conv, std=0.01)
         for m in self.mask_convs:
             normal_init(m.conv, std=0.01)
-       
+        '''
         bias_cls = bias_init_with_prob(0.01)
         for m in self.solo_cls:
             normal_init(m, std=0.01, bias=bias_cls)

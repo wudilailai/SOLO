@@ -4,11 +4,13 @@ import torch.nn as nn
 from mmcv.cnn import constant_init, kaiming_init
 
 from .conv_ws import ConvWS2d
+from .coord_conv import CoordConv
 from .norm import build_norm_layer
 
 conv_cfg = {
     'Conv': nn.Conv2d,
     'ConvWS': ConvWS2d,
+    'CoordConv' : CoordConv,
     # TODO: octave conv
 }
 
@@ -35,7 +37,6 @@ def build_conv_layer(cfg, *args, **kwargs):
         raise KeyError('Unrecognized norm type {}'.format(layer_type))
     else:
         conv_layer = conv_cfg[layer_type]
-
     layer = conv_layer(*args, **kwargs, **cfg_)
 
     return layer
@@ -149,7 +150,10 @@ class ConvModule(nn.Module):
 
     def init_weights(self):
         nonlinearity = 'relu' if self.activation is None else self.activation
-        kaiming_init(self.conv, nonlinearity=nonlinearity)
+        if self.conv_cfg is not None and 'CoordConv' == self.conv_cfg['type']:
+            kaiming_init(self.conv.conv, nonlinearity=nonlinearity)
+        else:
+            kaiming_init(self.conv, nonlinearity=nonlinearity)
         if self.with_norm:
             constant_init(self.norm, 1, bias=0)
 
