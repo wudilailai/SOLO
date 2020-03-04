@@ -22,9 +22,9 @@ class SoloHead(nn.Module):
                  stacked_convs=4,
                  radius=0.1,
                  dice_weight=3.0,
-                 strides=(4, 8, 16, 32, 64),
-                 regress_ranges=((-1, 64), (64, 128), (128, 256), (256, 512),
-                                 (512, INF)),
+                 strides=(8, 8, 16, 32, 32),
+                 regress_ranges=((-1, 96), (48, 192), (96, 384), (192, 768),
+                                 (384, INF)),
                  loss_cls=dict(
                      type='FocalLoss',
                      use_sigmoid=True,
@@ -95,6 +95,8 @@ class SoloHead(nn.Module):
             self.feat_channels, num**2, 1, padding=0) for num in self.grid_num])
         
         self.scales = nn.ModuleList([Scale(1.0) for _ in self.strides])
+        ori_strides = [4, 8, 16, 32, 64]
+        self.stride_scales = [ori/new for ori,new in zip(ori_strides, self.strides)]
 
     def init_weights(self):
         #ConvModule 已经有init了
@@ -109,11 +111,17 @@ class SoloHead(nn.Module):
             normal_init(m, std=0.01, bias=bias_cls)
         for m in self.solo_mask:
             normal_init(m, std=0.01)
+
     def forward(self, feats):
-        cls_score, mask_score = multi_apply(self.forward_single, feats, self.solo_cls, self.solo_mask, self.grid_num)
+        cls_score, mask_score = multi_apply(self.forward_single, feats, self.solo_cls, self.solo_mask, self.grid_num, self.stride_scales)
         return cls_score, mask_score
 
-    def forward_single(self, x, solo_cls, solo_mask, grid_num):
+    def forward_single(self, x, solo_cls, solo_mask, grid_num, stride_scale):
+        if stride_scale == 1:
+            pass
+        else:
+            x = F.interpolate(x, scale_factor=stride_scale, mode="bilinear")
+
         cls_feat = F.upsample_bilinear(x,(grid_num,grid_num))
         mask_feat = x
         for cls_layer in self.cls_convs:
@@ -305,6 +313,7 @@ class SoloHead(nn.Module):
              gt_bboxes_ignore=None):
         assert len(cls_scores) == len(mask_preds)
         featmap_sizes = [featmap.size()[-2:] for featmap in cls_scores]
+        #featmap_sizes == grid num
         mask_sizes = [mask.size()[-2:] for mask in mask_preds]
         cls_strides = []
         level=len(self.strides)
@@ -361,28 +370,54 @@ class SoloHead(nn.Module):
         scores, labels = torch.max(flatten_cls_scores,dim=-1)
         nms_pre = cfg.get('nms_pre', -1)
         mask_thr = cfg.get('mask_thr_binary',-1)
+        max_per_img = cfg.get('max_per_img', -1)
         crop_h, crop_w, _ = img_metas[0]['img_shape']
         ori_h, ori_w, _ = img_metas[0]['ori_shape']
+
         if nms_pre > 0 and scores.shape[0] > nms_pre:
             _, topk_inds = scores.topk(nms_pre)
             scores = scores[topk_inds]
             labels = labels[topk_inds]
-
             mask_preds = mask_preds[topk_inds]
+
+            mask_fake = F.sigmoid(mask_preds.unsqueeze(0))[0] > mask_thr
+            keeps = self.nms(scores, labels, mask_fake, cfg.nms.iou_thr)
+            keeps = torch.tensor(keeps)
+            scores = scores[keeps]
+            labels = labels[keeps]
+            mask_preds = mask_preds.squeeze(0)[keeps]
+
+            #reduce out answer to save mem
+            _, topk_inds = scores.topk(max_per_img)
+            scores = scores[topk_inds]
+            labels = labels[topk_inds]
+            mask_preds = mask_preds[topk_inds]
+
             mask_preds = F.upsample_bilinear(mask_preds.unsqueeze(0), (b_h*self.strides[0], b_w*self.strides[0]))
             mask_preds = mask_preds[:, :, :crop_h, :crop_w]
-            mask_preds = F.sigmoid(F.upsample_bilinear(mask_preds, (ori_h, ori_w)))[0]
+            #先做nms再 resize
+            '''
+            mask_fake = F.sigmoid(mask_preds)[0] > mask_thr
+            keeps = self.nms(scores, labels, mask_fake, cfg.nms.iou_thr)
+            keeps = torch.tensor(keeps)
+            scores = scores[keeps]
+            labels = labels[keeps]
+            mask_preds = mask_preds.squeeze(0)[keeps]
+            '''
+            mask_preds = mask_preds.squeeze(0)
+            mask_preds = F.upsample_bilinear(mask_preds.unsqueeze(0), (ori_h, ori_w))
+            mask_preds = F.sigmoid(mask_preds)[0]
             mask_preds = mask_preds > mask_thr
+            masks = mask_preds
 
-            masks = self.nms(scores, labels, mask_preds, cfg.nms.iou_thr)
             n = len(masks)
             det_bboxes = np.zeros((n, 5))
             det_labels = np.zeros(n).astype(int)
             det_masks = []
             for i in range(n):
-                det_bboxes[i, -1] = masks[i][-1]
-                det_labels[i] = masks[i][-2]
-                det_masks.append(masks[i][0])
+                det_bboxes[i, -1] = scores[i]
+                det_labels[i] = labels[i]
+                det_masks.append(masks[i])
             det_masks = np.array(det_masks)
         return det_bboxes, det_labels, det_masks
 
@@ -401,26 +436,28 @@ class SoloHead(nn.Module):
         :return:
         """
         return_mask = []
+        keeps = []
         n = len(labels)
         if n > 0:
             masks_dict = {}
             for i in range(n):
                 if labels[i].item() in masks_dict:
-                    masks_dict[labels[i].item()].append([masks[i],labels[i],scores[i]])
+                    masks_dict[labels[i].item()].append([masks[i],labels[i],scores[i],i])
                 else:
-                    masks_dict[labels[i].item()] = [[masks[i],labels[i],scores[i]]]
+                    masks_dict[labels[i].item()] = [[masks[i],labels[i],scores[i],i]]
             for masks in masks_dict.values():
                 if len(masks) == 1:
                     return_mask.append(masks[0])
+                    keeps.append(masks[0][3])
                 else:
                     while (len(masks)):
                         best_mask = masks.pop(0)
                         return_mask.append(best_mask)
+                        keeps.append(best_mask[3])
                         j = 0
                         for i in range(len(masks)):
                             i -= j
                             if self.iou_calc(best_mask[0], masks[i][0]) > iou_threshold:
                                 masks.pop(i)
                                 j += 1
-        return return_mask
-
+        return keeps
