@@ -188,25 +188,39 @@ class SoloHead(nn.Module):
             (x.reshape(-1), y.reshape(-1)), dim=-1)
         return points
 
+    def mask_to_bbox(self, mask):
+        """Compute the tight bounding box of a binary mask."""
+        xs = np.where(np.sum(mask, axis=0) > 0)[0]
+        ys = np.where(np.sum(mask, axis=1) > 0)[0]
+
+        if len(xs) == 0 or len(ys) == 0:
+            return None
+
+        x0 = xs[0]
+        x1 = xs[-1]
+        y0 = ys[0]
+        y1 = ys[-1]
+        return (x0, y0, x1, y1)
+
     def get_single_centerpoint(self, mask):
+
         contour, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
         contour.sort(key=lambda x: cv2.contourArea(x), reverse=True)  # only save the biggest one
 
+        x0,y0,x1,y1 = self.mask_to_bbox(mask)
+        return [int((x0+x1)/2), int((y0+y1)/2)]
         '''debug IndexError: list index out of range'''
-        count = contour[0][:, 0, :]
         try:
-            center = self.get_centerpoint(count)
+            count = contour[0][:, 0, :]
+            try:
+                center = self.get_centerpoint(count)
+            except:
+                x,y = count.mean(axis=0)
+                center=[int(x), int(y)]
         except:
-            x,y = count.mean(axis=0)
-            center=[int(x), int(y)]
-            
-        #decrease the number of contour, to speed up
-        # 360 points should ok, the performance drop very tiny.
-        max_points = 360
-        if len(contour[0]) > max_points:
-            compress_rate = len(contour[0]) // max_points
-            contour[0] = contour[0][::compress_rate, ...]
-        return center, contour
+            x0,y0,x1,y1 = self.mask_to_bbox(mask)
+            return [int((x0+x1)/2), int((y0+y1)/2)]
+        return center
 
     def get_sample_region(self, gt, mask_center, strides, num_points_per, gt_xs, gt_ys, radius=1):
         
@@ -320,6 +334,7 @@ class SoloHead(nn.Module):
         return concat_lvl_labels, concat_lvl_inds, inds_img
 
     def solo_target_single(self, gt_bboxes, gt_masks, gt_labels, points, regress_ranges, cls_strides):
+
         num_points = points.size(0)
         num_gts = gt_labels.size(0)
         if num_gts == 0:
@@ -345,20 +360,16 @@ class SoloHead(nn.Module):
 
         #mask targets 也按照这种写 同时labels 得从bbox中心修改成mask 重心
         mask_centers = []
-        mask_contours = []
         #第一步 先算重心  return [num_gt, 2]
         for mask in gt_masks:
-            cnt, contour = self.get_single_centerpoint(mask)
-            contour = contour[0]
-            contour = torch.Tensor(contour).float()
-
+            cnt = self.get_single_centerpoint(mask)
             y, x = cnt
             mask_centers.append([x,y])
-            mask_contours.append(contour)
         mask_centers = torch.Tensor(mask_centers).float()
         # 把mask_centers assign到不同的层上,根据regress_range和重心的位置
         mask_centers = mask_centers[None].expand(num_points, num_gts, 2)
-        mask_centers = mask_centers.to(points.device)
+        mask_centers = mask_centers.to(gt_bboxes.device)
+
         # condition1: inside a gt bbox
         # inside_gt_bbox_mask = bbox_targets.min(-1)[0] > 0
         # keep alignment !!!
@@ -371,12 +382,16 @@ class SoloHead(nn.Module):
                                                      radius=self.radius)
 
         # condition2: limit the regression range for each location
-        regress_ranges = regress_ranges * regress_ranges
-        inside_regress_range = (areas >= regress_ranges[..., 0]) & (areas <= regress_ranges[..., 1])
-        # max_regress_distance = bbox_targets.max(-1)[0]
-        # inside_regress_range = (
-        #                                max_regress_distance >= regress_ranges[..., 0]) & (
-        #                                max_regress_distance <= regress_ranges[..., 1])
+        #regress_ranges = regress_ranges * regress_ranges
+        #inside_regress_range = (areas >= regress_ranges[..., 0]) & (areas <= regress_ranges[..., 1])
+        #print(bbox_targets[0,0,:])
+        #max_regress_distance = bbox_targets.max(-1)[0]
+        avg_regress_distance = (-bbox_targets[:,:,0] - bbox_targets[:,:,1] +
+                                bbox_targets[:,:,2] + bbox_targets[:,:,3])/4
+        #print(avg_regress_distance.shape)
+        inside_regress_range = (
+                                       avg_regress_distance >= regress_ranges[..., 0]) & (
+                                       avg_regress_distance <= regress_ranges[..., 1])
 
         # if there are still more than one objects for a location,
         # we choose the one with minimal area
