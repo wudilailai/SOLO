@@ -2,6 +2,7 @@ from ..registry import DETECTORS
 from .single_stage import SingleStageDetector
 import numpy as np
 import pycocotools.mask as mask_util
+import torch.nn.functional as F
 import time
 
 @DETECTORS.register_module
@@ -38,8 +39,10 @@ class Solo(SingleStageDetector):
         bbox_inputs = outs + (img_meta, self.test_cfg, rescale)
         bbox_list = self.bbox_head.get_bboxes(*bbox_inputs)
         bbox_list=[bbox_list]
+        img_meta = None if not self.test_cfg.get('cpu_test', False) else img_meta[0]['cpu_postprocess']
         bbox_results = [
-            bbox_mask2result(det_bboxes, det_labels, det_masks, self.bbox_head.num_classes)
+            bbox_mask2result(det_bboxes, det_labels, det_masks, self.bbox_head.num_classes,
+                             img_meta=img_meta)
             for det_bboxes, det_labels, det_masks in bbox_list
         ]
         return bbox_results[0][0],bbox_results[0][1]
@@ -48,7 +51,7 @@ class Solo(SingleStageDetector):
         raise NotImplementedError
 
 
-def bbox_mask2result(bboxes,labels, masks, num_classes):
+def bbox_mask2result(bboxes,labels, masks, num_classes, img_meta=None):
     """Convert detection results to a list of numpy arrays.
     Args:
         bboxes (Tensor): shape (n, 5)
@@ -58,6 +61,23 @@ def bbox_mask2result(bboxes,labels, masks, num_classes):
     Returns:
         list(ndarray): bbox results of each class
     """
+
+    if img_meta is not None:
+        (pad_h, pad_w) = img_meta['pad_shape']
+        (crop_h, crop_w) = img_meta['img_shape']
+        ori_shape = img_meta['ori_shape']
+        mask_thr = img_meta['mask_thr']
+        masks = masks.cpu()
+        if img_meta.get('approx', True):
+            mask_h, mask_w = masks.shape[-2:]
+            valid_h, valid_w = int((crop_h / pad_h) * mask_h), int((crop_w / pad_w) * mask_w)
+            mask_preds = masks[:, :valid_h, :valid_w]
+            mask_preds = F.interpolate(mask_preds.unsqueeze(0), size=ori_shape, mode='bilinear', align_corners=True)[0]
+        else:
+            mask_preds = F.upsample_bilinear(masks.unsqueeze(0), (pad_h, pad_w))
+            mask_preds = mask_preds[:, :, :crop_h, :crop_w]
+            mask_preds = F.upsample_bilinear(mask_preds, ori_shape)[0]
+        masks = mask_preds > mask_thr
 
     mask_results = [[] for _ in range(num_classes - 1)]
     for i in range(masks.shape[0]):

@@ -8,6 +8,8 @@ from ..registry import HEADS
 from ..utils import ConvModule, Scale, bias_init_with_prob
 import numpy as np
 import itertools
+import cv2
+
 INF = 1e8
 import time
 
@@ -20,8 +22,9 @@ class SoloHead(nn.Module):
                  in_channels,
                  feat_channels=256,
                  stacked_convs=4,
-                 radius=0.1,
+                 radius=0.2,
                  dice_weight=3.0,
+                 grid_num=[40, 36, 24, 16, 12],
                  strides=(8, 8, 16, 32, 32),
                  regress_ranges=((-1, 96), (48, 192), (96, 384), (192, 768),
                                  (384, INF)),
@@ -43,11 +46,11 @@ class SoloHead(nn.Module):
         self.strides = strides
         self.regress_ranges = regress_ranges
         self.loss_cls = build_loss(loss_cls)
-        #self.loss_mask = build_loss(loss_mask)
+        # self.loss_mask = build_loss(loss_mask)
         self.conv_cfg = conv_cfg
         self.norm_cfg = norm_cfg
         self.fp16_enabled = False
-        self.grid_num =[40,36,24,16,12]
+        self.grid_num = grid_num
         self.radius = radius
         self.dice_weight = dice_weight
         self._init_layers()
@@ -92,14 +95,14 @@ class SoloHead(nn.Module):
         self.solo_cls = nn.ModuleList([nn.Conv2d(
             self.feat_channels, self.cls_out_channels, 1, padding=0) for _ in self.grid_num])
         self.solo_mask = nn.ModuleList([nn.Conv2d(
-            self.feat_channels, num**2, 1, padding=0) for num in self.grid_num])
-        
+            self.feat_channels, num ** 2, 1, padding=0) for num in self.grid_num])
+
         self.scales = nn.ModuleList([Scale(1.0) for _ in self.strides])
         ori_strides = [4, 8, 16, 32, 64]
-        self.stride_scales = [ori/new for ori,new in zip(ori_strides, self.strides)]
+        self.stride_scales = [ori / new for ori, new in zip(ori_strides, self.strides)]
 
     def init_weights(self):
-        #ConvModule 已经有init了
+        # ConvModule 已经有init了
         '''
         for m in self.cls_convs:
             normal_init(m.conv, std=0.01)
@@ -113,16 +116,15 @@ class SoloHead(nn.Module):
             normal_init(m, std=0.01)
 
     def forward(self, feats):
-        cls_score, mask_score = multi_apply(self.forward_single, feats, self.solo_cls, self.solo_mask, self.grid_num, self.stride_scales)
+        cls_score, mask_score = multi_apply(self.forward_single, feats, self.solo_cls, self.solo_mask, self.grid_num,
+                                            self.stride_scales)
         return cls_score, mask_score
 
     def forward_single(self, x, solo_cls, solo_mask, grid_num, stride_scale):
-        if stride_scale == 1:
-            pass
-        else:
+        if stride_scale != 1:
             x = F.interpolate(x, scale_factor=stride_scale, mode="bilinear")
 
-        cls_feat = F.upsample_bilinear(x,(grid_num,grid_num))
+        cls_feat = F.upsample_bilinear(x, (grid_num, grid_num))
         mask_feat = x
         for cls_layer in self.cls_convs:
             cls_feat = cls_layer(cls_feat)
@@ -136,13 +138,26 @@ class SoloHead(nn.Module):
         return cls_score, mask_score
 
     def dice_loss(self,input, target):
-        smooth = 1.
+        '''
+        print(input.shape, target.shape)
+        smooth = 0.
         iflat = input.contiguous().view(-1)
         tflat = target.contiguous().view(-1)
         intersection = (iflat * tflat).sum()
 
         return 1 - ((2. * intersection + smooth) /
               ((iflat*iflat).sum() + (tflat*tflat).sum() + smooth))
+        '''
+        num = target.size(0)
+        smooth = 1
+        probs = F.sigmoid(input)
+        m1 = probs.view(num, -1)
+        m2 = target.view(num, -1)
+
+        intersection = (m1 * m2)
+        score = 2. * (intersection.sum(1) + smooth) / ((m1*m1).sum(1) + (m2*m2).sum(1) + smooth)
+        score = 1 - score.sum() / num
+        return score
 
 
     def get_points(self, featmap_sizes, strides, dtype, device):
@@ -159,21 +174,73 @@ class SoloHead(nn.Module):
         for i in range(len(featmap_sizes)):
             mlvl_points.append(
                 self.get_points_single(featmap_sizes[i], strides[i],
-                                        dtype, device))
+                                       dtype, device))
         return mlvl_points
 
     def get_points_single(self, featmap_size, stride, dtype, device):
         h, w = featmap_size
         x_range = torch.arange(
-            0, w * stride[0], stride[0], dtype=dtype, device=device)+stride[0]//2
+            0, w * stride[0], stride[0], dtype=dtype, device=device) + stride[0] // 2
         y_range = torch.arange(
-            0, h * stride[1], stride[1], dtype=dtype, device=device)+stride[1]//2
+            0, h * stride[1], stride[1], dtype=dtype, device=device) + stride[1] // 2
         y, x = torch.meshgrid(y_range, x_range)
         points = torch.stack(
-             (x.reshape(-1), y.reshape(-1)), dim=-1)
+            (x.reshape(-1), y.reshape(-1)), dim=-1)
         return points
 
-    def get_sample_region(self, gt, strides, num_points_per, gt_xs, gt_ys, radius=1):
+    def get_single_centerpoint(self, mask):
+        contour, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
+        contour.sort(key=lambda x: cv2.contourArea(x), reverse=True)  # only save the biggest one
+
+        '''debug IndexError: list index out of range'''
+        count = contour[0][:, 0, :]
+        try:
+            center = self.get_centerpoint(count)
+        except:
+            x,y = count.mean(axis=0)
+            center=[int(x), int(y)]
+            
+        #decrease the number of contour, to speed up
+        # 360 points should ok, the performance drop very tiny.
+        max_points = 360
+        if len(contour[0]) > max_points:
+            compress_rate = len(contour[0]) // max_points
+            contour[0] = contour[0][::compress_rate, ...]
+        return center, contour
+
+    def get_sample_region(self, gt, mask_center, strides, num_points_per, gt_xs, gt_ys, radius=1):
+        
+        center_y = mask_center[..., 0]
+        center_x = mask_center[..., 1]
+        center_gt = gt.new_zeros(gt.shape)
+        w = gt[..., 2] - gt[..., 0]
+        h = gt[..., 3] - gt[..., 1]
+        #no gt
+        if center_x[..., 0].sum() == 0:
+            return gt_xs.new_zeros(gt_xs.shape, dtype=torch.uint8)
+
+        beg = 0
+        for level,n_p in enumerate(num_points_per):
+            end = beg + n_p
+            xmin = center_x[beg:end] - w[beg:end] * radius
+            ymin = center_y[beg:end] - h[beg:end] * radius
+            xmax = center_x[beg:end] + w[beg:end] * radius
+            ymax = center_y[beg:end] + h[beg:end] * radius
+            # limit sample region in gt
+            center_gt[beg:end, :, 0] = torch.where(xmin > gt[beg:end, :, 0], xmin, gt[beg:end, :, 0])
+            center_gt[beg:end, :, 1] = torch.where(ymin > gt[beg:end, :, 1], ymin, gt[beg:end, :, 1])
+            center_gt[beg:end, :, 2] = torch.where(xmax > gt[beg:end, :, 2], gt[beg:end, :, 2], xmax)
+            center_gt[beg:end, :, 3] = torch.where(ymax > gt[beg:end, :, 3], gt[beg:end, :, 3], ymax)
+            beg = end
+
+        left = gt_xs - center_gt[..., 0]
+        right = center_gt[..., 2] - gt_xs
+        top = gt_ys - center_gt[..., 1]
+        bottom = center_gt[..., 3] - gt_ys
+        center_bbox = torch.stack((left, top, right, bottom), -1)
+        inside_gt_bbox_mask = center_bbox.min(-1)[0] > 0  # 上下左右都>0 就是在bbox里面
+        return inside_gt_bbox_mask
+        '''
         center_x = (gt[..., 0] + gt[..., 2]) / 2
         center_y = (gt[..., 1] + gt[..., 3]) / 2
         w = gt[..., 2] - gt[..., 0]
@@ -196,7 +263,7 @@ class SoloHead(nn.Module):
             center_gt[beg:end, :, 2] = torch.where(xmax > gt[beg:end, :, 2], gt[beg:end, :, 2], xmax)
             center_gt[beg:end, :, 3] = torch.where(ymax > gt[beg:end, :, 3], gt[beg:end, :, 3], ymax)
             beg = end
- 
+
         left = gt_xs - center_gt[..., 0]
         right = center_gt[..., 2] - gt_xs
         top = gt_ys - center_gt[..., 1]
@@ -204,9 +271,10 @@ class SoloHead(nn.Module):
         center_bbox = torch.stack((left, top, right, bottom), -1)
         inside_gt_bbox_mask = center_bbox.min(-1)[0] > 0
         return inside_gt_bbox_mask
+        '''
+        
 
-
-    def solo_target(self, points, gt_bboxes_list, gt_labels_list, strides):
+    def solo_target(self, points, gt_bboxes_list, gt_masks_list, gt_labels_list, strides):
         assert len(points) == len(self.regress_ranges)
         num_levels = len(points)
         # expand regress ranges to align with points
@@ -219,26 +287,27 @@ class SoloHead(nn.Module):
         concat_points = torch.cat(points, dim=0)
         # split to per img, per level
         num_points = [center.size(0) for center in points]
-        self.num_points_per_level=num_points
+        self.num_points_per_level = num_points
         # get labels and bbox_targets of each image
         labels_list, inds_list = multi_apply(
             self.solo_target_single,
             gt_bboxes_list,
+            gt_masks_list,
             gt_labels_list,
             points=concat_points,
             regress_ranges=concat_regress_ranges,
-            cls_strides = strides)
+            cls_strides=strides)
         labels_list = [labels.split(num_points, 0) for labels in labels_list]
 
         inds_list = [inds.split(num_points, 0) for inds in inds_list]
         # concat per level image
         concat_lvl_labels = []
-        concat_lvl_inds=[]
-        num_imgs=len(labels_list)
-        inds_img=[]
+        concat_lvl_inds = []
+        num_imgs = len(labels_list)
+        inds_img = []
         for j in range(5):
             for i in range(num_imgs):
-                size=len(labels_list[i][j])
+                size = len(labels_list[i][j])
                 inds_img.append([i for k in range(size)])
         inds_img = list(itertools.chain.from_iterable(inds_img))
 
@@ -248,9 +317,9 @@ class SoloHead(nn.Module):
             concat_lvl_inds.append(
                 torch.cat(
                     [inds[i] for inds in inds_list]))
-        return concat_lvl_labels, concat_lvl_inds, inds_img  
+        return concat_lvl_labels, concat_lvl_inds, inds_img
 
-    def solo_target_single(self, gt_bboxes, gt_labels,  points, regress_ranges, cls_strides):
+    def solo_target_single(self, gt_bboxes, gt_masks, gt_labels, points, regress_ranges, cls_strides):
         num_points = points.size(0)
         num_gts = gt_labels.size(0)
         if num_gts == 0:
@@ -258,7 +327,7 @@ class SoloHead(nn.Module):
                    gt_bboxes.new_zeros((num_points, 4))
 
         areas = (gt_bboxes[:, 2] - gt_bboxes[:, 0] + 1) * (
-            gt_bboxes[:, 3] - gt_bboxes[:, 1] + 1)
+                gt_bboxes[:, 3] - gt_bboxes[:, 1] + 1)
         # TODO: figure out why these two are different
         # areas = areas[None].expand(num_points, num_gts)
         areas = areas[None].repeat(num_points, 1)
@@ -274,22 +343,40 @@ class SoloHead(nn.Module):
         bottom = gt_bboxes[..., 3] - ys
         bbox_targets = torch.stack((left, top, right, bottom), -1)
 
+        #mask targets 也按照这种写 同时labels 得从bbox中心修改成mask 重心
+        mask_centers = []
+        mask_contours = []
+        #第一步 先算重心  return [num_gt, 2]
+        for mask in gt_masks:
+            cnt, contour = self.get_single_centerpoint(mask)
+            contour = contour[0]
+            contour = torch.Tensor(contour).float()
+
+            y, x = cnt
+            mask_centers.append([x,y])
+            mask_contours.append(contour)
+        mask_centers = torch.Tensor(mask_centers).float()
+        # 把mask_centers assign到不同的层上,根据regress_range和重心的位置
+        mask_centers = mask_centers[None].expand(num_points, num_gts, 2)
+        mask_centers = mask_centers.to(points.device)
         # condition1: inside a gt bbox
-        #inside_gt_bbox_mask = bbox_targets.min(-1)[0] > 0
+        # inside_gt_bbox_mask = bbox_targets.min(-1)[0] > 0
         # keep alignment !!!
-        
         inside_gt_bbox_mask = self.get_sample_region(gt_bboxes,
+                                                     mask_centers,
                                                      cls_strides,
                                                      self.num_points_per_level,
                                                      xs,
                                                      ys,
                                                      radius=self.radius)
-        
+
         # condition2: limit the regression range for each location
-        max_regress_distance = bbox_targets.max(-1)[0]
-        inside_regress_range = (
-            max_regress_distance >= regress_ranges[..., 0]) & (
-                max_regress_distance <= regress_ranges[..., 1])
+        regress_ranges = regress_ranges * regress_ranges
+        inside_regress_range = (areas >= regress_ranges[..., 0]) & (areas <= regress_ranges[..., 1])
+        # max_regress_distance = bbox_targets.max(-1)[0]
+        # inside_regress_range = (
+        #                                max_regress_distance >= regress_ranges[..., 0]) & (
+        #                                max_regress_distance <= regress_ranges[..., 1])
 
         # if there are still more than one objects for a location,
         # we choose the one with minimal area
@@ -313,63 +400,131 @@ class SoloHead(nn.Module):
              gt_bboxes_ignore=None):
         assert len(cls_scores) == len(mask_preds)
         featmap_sizes = [featmap.size()[-2:] for featmap in cls_scores]
-        #featmap_sizes == grid num
+        # featmap_sizes == grid num
         mask_sizes = [mask.size()[-2:] for mask in mask_preds]
         cls_strides = []
-        level=len(self.strides)
+        level = len(self.strides)
         for i in range(level):
             f_y, f_x = featmap_sizes[i]
             m_y, m_x = mask_sizes[i]
             s_y = m_y / f_y * self.strides[i]
             s_x = m_x / f_x * self.strides[i]
-            cls_strides.append([s_x,s_y])
+            cls_strides.append([s_x, s_y])
         all_level_points = self.get_points(featmap_sizes, cls_strides, cls_scores[0].dtype,
-                                 cls_scores[0].device)
-        labels, inds, img_inds = self.solo_target(all_level_points, gt_bboxes,
-                                 gt_labels, cls_strides)
+                                           cls_scores[0].device)
+        labels, inds, img_inds = self.solo_target(all_level_points, gt_bboxes, gt_masks,
+                                                  gt_labels, cls_strides)
         num_imgs = cls_scores[0].size(0)
-        flatten_cls_scores = [cls_score.permute(0, 2, 3, 1).reshape(-1, self.cls_out_channels) for cls_score in cls_scores]
+        flatten_cls_scores = [cls_score.permute(0, 2, 3, 1).reshape(-1, self.cls_out_channels) for cls_score in
+                              cls_scores]
         flatten_cls_scores = torch.cat(flatten_cls_scores)
         flatten_labels = torch.cat(labels)
+        #print(inds)
+        #import IPython
+        #IPython.embed()
         flatten_inds = torch.cat(inds)
         img_inds = torch.tensor(img_inds).to(flatten_inds.device)
         pos_inds = flatten_labels.nonzero().reshape(-1)
         num_pos = len(pos_inds)
         loss_cls = self.loss_cls(flatten_cls_scores, flatten_labels,
-            avg_factor=num_pos + num_imgs)  # avoid num_pos is 0
-        
-        #flatten mask pred
-        _,_,b_h,b_w = mask_preds[0].shape
-        for i in range(5):
-            mask_preds[i] = F.sigmoid(F.upsample_bilinear(mask_preds[i],(b_h,b_w))).view(-1,b_h,b_w)
-        mask_preds = torch.cat([mask_pred for mask_pred in mask_preds],dim=0)
-        mask_preds=mask_preds[pos_inds]
-        pos_ins_inds=flatten_inds[pos_inds]
-        pos_img_inds=img_inds[pos_inds]
-        mask_target=torch.zeros((len(pos_inds),b_h,b_w)).to(mask_preds.device)
-        for i in range(num_imgs):
-            _, i_h, i_w = gt_masks[i].shape
-            gt_masks[i] = nn.ConstantPad2d((0,b_w*self.strides[0]-i_w,0,b_h*self.strides[0]-i_h),0)(torch.tensor(gt_masks[i])).to(mask_preds.device)
-            gt_masks[i] = F.upsample_bilinear(gt_masks[i].float().unsqueeze(0),(b_h,b_w))[0]
-            ind_this_img = torch.nonzero(pos_img_inds == i).flatten()
-            ins_this_img = pos_ins_inds[ind_this_img]
-            mask_target[ind_this_img]=gt_masks[i][ins_this_img]
-        loss_mask = self.dice_loss(mask_preds,mask_target)*self.dice_weight
-        
-        return dict(
-               loss_cls=loss_cls,
-               loss_mask=loss_mask)       
-   
-    @force_fp32(apply_to=('cls_scores', 'mask_preds'))
-    def get_bboxes(self,cls_scores, mask_preds, img_metas, cfg, rescale=None):
-        flatten_cls_scores = torch.cat([cls_score.permute(0, 2, 3, 1).reshape(-1, self.cls_out_channels) for cls_score in cls_scores]).sigmoid()
+                                 avg_factor=num_pos + num_imgs)  # avoid num_pos is 0
+
+        # flatten mask pred
         _, _, b_h, b_w = mask_preds[0].shape
         for i in range(5):
-            mask_preds[i] = F.upsample_bilinear(mask_preds[i],(b_h,b_w))
-        mask_preds = torch.cat(mask_preds,dim=1)[0]
-        scores, labels = torch.max(flatten_cls_scores,dim=-1)
+            mask_preds[i] = F.sigmoid(F.upsample_bilinear(mask_preds[i], (b_h, b_w))).view(-1, b_h, b_w)
+        mask_preds = torch.cat([mask_pred for mask_pred in mask_preds], dim=0)
+
+        mask_preds = mask_preds[pos_inds]
+        pos_ins_inds = flatten_inds[pos_inds]
+        pos_img_inds = img_inds[pos_inds]
+        mask_target = torch.zeros((len(pos_inds), b_h, b_w)).to(mask_preds.device)
+        for i in range(num_imgs):
+            _, i_h, i_w = gt_masks[i].shape
+            gt_masks[i] = nn.ConstantPad2d((0, b_w * self.strides[0] - i_w, 0, b_h * self.strides[0] - i_h), 0)(
+                torch.tensor(gt_masks[i])).to(mask_preds.device)
+            gt_masks[i] = F.upsample_bilinear(gt_masks[i].float().unsqueeze(0), (b_h, b_w))[0]
+            ind_this_img = torch.nonzero(pos_img_inds == i).flatten()
+            ins_this_img = pos_ins_inds[ind_this_img]
+            mask_target[ind_this_img] = gt_masks[i][ins_this_img]
+        loss_mask = self.dice_loss(mask_preds, mask_target) * self.dice_weight
+
+        return dict(
+            loss_cls=loss_cls,
+            loss_mask=loss_mask)
+
+    def get_bboxes_cpu(self, cls_scores, mask_preds, img_metas, cfg):
+        flatten_cls_scores = torch.cat(
+            [cls_score.permute(0, 2, 3, 1).reshape(-1, self.cls_out_channels) for cls_score in cls_scores]).sigmoid()
+        _, _, b_h, b_w = mask_preds[0].shape
+        for i in range(5):
+            mask_preds[i] = F.upsample_bilinear(mask_preds[i], (b_h, b_w))
+        mask_preds = torch.cat(mask_preds, dim=1)[0]
+        scores, labels = torch.max(flatten_cls_scores, dim=-1)
         nms_pre = cfg.get('nms_pre', -1)
-        mask_thr = cfg.get('mask_thr_binary',-1)
+        mask_thr = cfg.get('mask_thr_binary', -1)
+        max_per_img = cfg.get('max_per_img', -1)
+        crop_h, crop_w, _ = img_metas[0]['img_shape']
+        ori_h, ori_w, _ = img_metas[0]['ori_shape']
+
+        score_thr = cfg.get('score_thr', 0)
+        conf_inds = scores > score_thr
+        mask_preds, scores, labels = mask_preds[conf_inds], scores[conf_inds], labels[conf_inds]
+
+        if nms_pre > 0 and scores.shape[0] > nms_pre:
+            _, topk_inds = scores.topk(nms_pre)
+            scores = scores[topk_inds]
+            labels = labels[topk_inds]
+            mask_preds = mask_preds[topk_inds]
+
+        mask_fake = F.sigmoid(mask_preds.unsqueeze(0))[0] > mask_thr
+        keeps = self.nms(scores, labels, mask_fake, cfg.nms.iou_thr)
+        keeps = torch.tensor(keeps)
+        scores = scores[keeps]
+        labels = labels[keeps]
+        mask_preds = mask_preds[keeps]
+
+        # reduce out answer to save mem
+        if max_per_img < scores.shape[0]:
+            _, topk_inds = scores.topk(max_per_img)
+            scores = scores[topk_inds]
+            labels = labels[topk_inds]
+            mask_preds = mask_preds[topk_inds]
+
+        pp = dict()
+        pp['pad_shape'] = (b_h * self.strides[0], b_w * self.strides[0])
+        pp['img_shape'] = (crop_h, crop_w)
+        pp['ori_shape'] = (ori_h, ori_w)
+        pp['mask_thr'] = mask_thr
+        img_metas[0]['cpu_postprocess'] = pp
+        masks = mask_preds.sigmoid()
+
+        n = len(masks)
+        det_bboxes = np.zeros((n, 5))
+        det_labels = np.zeros(n).astype(int)
+        det_masks = []
+        for i in range(n):
+            det_bboxes[i, -1] = scores[i]
+            det_labels[i] = labels[i]
+            det_masks.append(masks[i])
+        # det_masks = np.array(det_masks)
+        det_masks = torch.stack(det_masks, dim=0)
+        return det_bboxes, det_labels, det_masks
+
+    @force_fp32(apply_to=('cls_scores', 'mask_preds'))
+    def get_bboxes(self, cls_scores, mask_preds, img_metas, cfg, rescale=None):
+        if cfg.get('cpu_test', False):
+            return self.get_bboxes_cpu(cls_scores, mask_preds, img_metas, cfg)
+
+        flatten_cls_scores = torch.cat(
+            [cls_score.permute(0, 2, 3, 1).reshape(-1, self.cls_out_channels) for cls_score in cls_scores]).sigmoid()
+        _, _, b_h, b_w = mask_preds[0].shape
+        for i in range(5):
+            mask_preds[i] = F.upsample_bilinear(mask_preds[i], (b_h, b_w))
+        mask_preds = torch.cat(mask_preds, dim=1)[0]
+        scores, labels = torch.max(flatten_cls_scores, dim=-1)
+        nms_pre = cfg.get('nms_pre', -1)
+        mask_thr = cfg.get('mask_thr_binary', -1)
         max_per_img = cfg.get('max_per_img', -1)
         crop_h, crop_w, _ = img_metas[0]['img_shape']
         ori_h, ori_w, _ = img_metas[0]['ori_shape']
@@ -388,14 +543,15 @@ class SoloHead(nn.Module):
             mask_preds = mask_preds.squeeze(0)[keeps]
 
             #reduce out answer to save mem
-            _, topk_inds = scores.topk(max_per_img)
-            scores = scores[topk_inds]
-            labels = labels[topk_inds]
-            mask_preds = mask_preds[topk_inds]
+            if max_per_img < scores.shape[0]:
+                _, topk_inds = scores.topk(max_per_img)
+                scores = scores[topk_inds]
+                labels = labels[topk_inds]
+                mask_preds = mask_preds[topk_inds]
 
-            mask_preds = F.upsample_bilinear(mask_preds.unsqueeze(0), (b_h*self.strides[0], b_w*self.strides[0]))
+            mask_preds = F.upsample_bilinear(mask_preds.unsqueeze(0), (b_h * self.strides[0], b_w * self.strides[0]))
             mask_preds = mask_preds[:, :, :crop_h, :crop_w]
-            #先做nms再 resize
+            # 先做nms再 resize
             '''
             mask_fake = F.sigmoid(mask_preds)[0] > mask_thr
             keeps = self.nms(scores, labels, mask_fake, cfg.nms.iou_thr)
@@ -421,14 +577,13 @@ class SoloHead(nn.Module):
             det_masks = np.array(det_masks)
         return det_bboxes, det_labels, det_masks
 
-
-    def iou_calc(self,mask1,mask2):
+    def iou_calc(self, mask1, mask2):
         overlap = mask1 & mask2
         union = mask1 | mask2
-        iou = float(overlap.sum()+1)/float(union.sum()+1)
+        iou = float(overlap.sum() + 1) / float(union.sum() + 1)
         return iou
 
-    def nms(self, scores,labels,masks,iou_threshold=0.5):
+    def nms(self, scores, labels, masks, iou_threshold=0.5):
         """
         nms function
         :param boxes: list of box
@@ -442,9 +597,9 @@ class SoloHead(nn.Module):
             masks_dict = {}
             for i in range(n):
                 if labels[i].item() in masks_dict:
-                    masks_dict[labels[i].item()].append([masks[i],labels[i],scores[i],i])
+                    masks_dict[labels[i].item()].append([masks[i], labels[i], scores[i], i])
                 else:
-                    masks_dict[labels[i].item()] = [[masks[i],labels[i],scores[i],i]]
+                    masks_dict[labels[i].item()] = [[masks[i], labels[i], scores[i], i]]
             for masks in masks_dict.values():
                 if len(masks) == 1:
                     return_mask.append(masks[0])
