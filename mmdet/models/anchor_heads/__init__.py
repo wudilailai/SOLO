@@ -8,8 +8,9 @@ from .retina_head import RetinaHead
 from .rpn_head import RPNHead
 from .ssd_head import SSDHead
 from .solo_head import SoloHead
+from .solo_head_decouple import DecoupledSoloHead
 __all__ = [
     'AnchorHead', 'GuidedAnchorHead', 'FeatureAdaption', 'RPNHead',
     'GARPNHead', 'RetinaHead', 'GARetinaHead', 'SSDHead', 'FCOSHead',
-    'RepPointsHead','SoloHead'
+    'RepPointsHead','SoloHead','DecoupledSoloHead'
 ]
