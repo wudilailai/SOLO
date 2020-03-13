@@ -53,6 +53,7 @@ class DecoupledSoloHead(nn.Module):
         self.norm_cfg = norm_cfg
         self.fp16_enabled = False
         self.grid_num = grid_num
+
         self.radius = radius
         self.dice_weight = dice_weight
         self._init_layers()
@@ -160,6 +161,8 @@ class DecoupledSoloHead(nn.Module):
             #print(input_list[i].shape)
             #print(scores.shape)
             scores_list.append(scores)
+        if len(scores_list) == 0:
+            return torch.tensor(1.0)
         scores = torch.cat(scores_list, dim=0)
         #print(scores.sum(), scores.size(0))
         #print("----------")
@@ -170,6 +173,9 @@ class DecoupledSoloHead(nn.Module):
         return score
 
     def dice_loss_helper(self,input, target):
+        
+        print(input.shape, target.shape)
+
         num = target.size(0)
         smooth = 1
         m1 = input.view(num, -1)
@@ -525,19 +531,33 @@ class DecoupledSoloHead(nn.Module):
         det_masks = torch.stack(det_masks, dim=0)
         return det_bboxes, det_labels, det_masks
 
-    @force_fp32(apply_to=('cls_scores', 'mask_preds'))
+    @force_fp32(apply_to=('cls_scores', 'mask_preds_x', 'mask_preds_y'))
     def get_bboxes(self, cls_scores, mask_preds_x, mask_preds_y, img_metas, cfg, rescale=None):
 
+        x_to_new = []
+        y_to_new = []
+        base = 0
+        for grid in self.grid_num:
+            single_x_new = torch.tensor([i for i in range(grid)]* grid).long() + base
+            single_y_new = torch.tensor([i for i in range(grid) for j in range(grid) ]).long() + base
+            x_to_new.append(single_x_new)
+            y_to_new.append(single_y_new)
+            
+            base += grid
+        x_to_new = torch.cat(x_to_new).flatten()
+        y_to_new = torch.cat(y_to_new).flatten()
 
         if cfg.get('cpu_test', False):
             return self.get_bboxes_cpu(cls_scores, mask_preds, img_metas, cfg)
 
         flatten_cls_scores = torch.cat(
             [cls_score.permute(0, 2, 3, 1).reshape(-1, self.cls_out_channels) for cls_score in cls_scores]).sigmoid()
-        _, _, b_h, b_w = mask_preds[0].shape
+        _, _, b_h, b_w = mask_preds_x[0].shape
         for i in range(5):
-            mask_preds[i] = F.upsample_bilinear(mask_preds[i], (b_h, b_w))
-        mask_preds = torch.cat(mask_preds, dim=1)[0]
+            mask_preds_x[i] = F.upsample_bilinear(mask_preds_x[i], (b_h, b_w))
+            mask_preds_y[i] = F.upsample_bilinear(mask_preds_y[i], (b_h, b_w))
+        mask_preds_x = torch.cat(mask_preds_x, dim=1)[0]
+        mask_preds_y = torch.cat(mask_preds_y, dim=1)[0]
         scores, labels = torch.max(flatten_cls_scores, dim=-1)
         nms_pre = cfg.get('nms_pre', -1)
         mask_thr = cfg.get('mask_thr_binary', -1)
@@ -549,15 +569,19 @@ class DecoupledSoloHead(nn.Module):
             _, topk_inds = scores.topk(nms_pre)
             scores = scores[topk_inds]
             labels = labels[topk_inds]
-            mask_preds = mask_preds[topk_inds]
 
-            mask_fake = F.sigmoid(mask_preds.unsqueeze(0))[0] > mask_thr
+            # 这里需要注意
+            mask_preds_x = mask_preds_x[x_to_new[topk_inds]]
+            mask_preds_y = mask_preds_y[y_to_new[topk_inds]]
+
+            mask_preds = (mask_preds_x.sigmoid()).mul(mask_preds_y.sigmoid())
+            #mask_preds = mask_preds[topk_inds]
+            mask_fake = (mask_preds.unsqueeze(0))[0] > mask_thr
             keeps = self.nms(scores, labels, mask_fake, cfg.nms.iou_thr)
             keeps = torch.tensor(keeps)
             scores = scores[keeps]
             labels = labels[keeps]
             mask_preds = mask_preds.squeeze(0)[keeps]
-
             #reduce out answer to save mem
             if max_per_img < scores.shape[0]:
                 _, topk_inds = scores.topk(max_per_img)
@@ -578,9 +602,9 @@ class DecoupledSoloHead(nn.Module):
             '''
             mask_preds = mask_preds.squeeze(0)
             mask_preds = F.upsample_bilinear(mask_preds.unsqueeze(0), (ori_h, ori_w))
-            mask_preds = F.sigmoid(mask_preds)[0]
+            #mask_preds = F.sigmoid(mask_preds)[0]
             mask_preds = mask_preds > mask_thr
-            masks = mask_preds
+            masks = mask_preds.squeeze(0)
 
             n = len(masks)
             det_bboxes = np.zeros((n, 5))
@@ -591,6 +615,8 @@ class DecoupledSoloHead(nn.Module):
                 det_labels[i] = labels[i]
                 det_masks.append(masks[i])
             det_masks = np.array(det_masks)
+        else:
+            raise RuntimeError("wroong nms_pre")
         return det_bboxes, det_labels, det_masks
 
     def iou_calc(self, mask1, mask2):
