@@ -13,7 +13,7 @@ INF = 1e8
 import time
 
 @HEADS.register_module
-class DecoupledSoloHead2(nn.Module):
+class DecoupledSoloHead(nn.Module):
 
     def __init__(self,
                  num_classes,
@@ -36,7 +36,7 @@ class DecoupledSoloHead2(nn.Module):
                      loss_weight=1.0),
                  conv_cfg=None,
                  norm_cfg=dict(type='GN', num_groups=32, requires_grad=True)):
-        super(DecoupledSoloHead2, self).__init__()
+        super(DecoupledSoloHead, self).__init__()
 
         self.num_classes = num_classes
         self.cls_out_channels = num_classes - 1
@@ -164,7 +164,7 @@ class DecoupledSoloHead2(nn.Module):
         '''
         num = target.size(0)
         smooth = 1
-        if num == 1:
+        if num == 0:
             return torch.tensor(1.0)
         m1 = input.view(num, -1)
         m2 = target.view(num, -1)
@@ -398,42 +398,58 @@ class DecoupledSoloHead2(nn.Module):
                                  avg_factor=num_pos + num_imgs)  # avoid num_pos is 0
 
         # flatten mask pred
+        mask_preds_list = []
+        mask_targets_list = []
+        ins_num = 0
+        for i in range(5):
+            _, _, b_h, b_w = mask_preds_x[0].shape
+            grid_num = self.grid_num[i]
+            pos_inds = labels[i].nonzero().reshape(-1)
+            pos_ins_y = pos_inds//grid_num
+            pos_ins_x = pos_inds%grid_num
+
+            pos_ins_inds = inds[i][pos_inds]
+
+            mask_preds_x[i] = F.sigmoid(F.upsample_bilinear(mask_preds[i], (b_h, b_w)).view(-1, b_h, b_w)[pos_ins_x])
+            mask_preds_y[i] = F.sigmoid(F.upsample_bilinear(mask_preds[i], (b_h, b_w)).view(-1, b_h, b_w)[pos_ins_y])
+            #import IPython 
+            #IPython.embed()
+            pos_img_inds = img_inds[pos_inds + ins_num]
+            ins_num += len(labels[i])
+            mask_targets = torch.zeros((len(pos_inds), b_h, b_w)).to(mask_preds_x[0].device)
+            for j in range(num_imgs):
+                _, i_h, i_w = gt_masks[j].shape
+                temp_mask = nn.ConstantPad2d((0, b_w * self.strides[i] - i_w, 0, b_h * self.strides[i] - i_h), 0)(
+                    torch.tensor(gt_masks[j])).to(mask_preds_x[0].device)
+                temp_mask = F.upsample_bilinear(temp_mask.float().unsqueeze(0), (b_h, b_w))[0]
+                ind_this_img = torch.nonzero(pos_img_inds == j).flatten()
+                ins_this_img = pos_ins_inds[ind_this_img]
+                mask_targets[ind_this_img] = temp_mask[ins_this_img]
+
+            mask_preds_list.append(mask_preds_x[i].mul(mask_preds_y[i]))
+            mask_targets_list.append(mask_targets)
+        mask_preds = torch.cat(mask_preds_list)
+        mask_targets = torch.cat(mask_targets_list)
+        loss_mask = self.dice_loss(mask_preds, mask_targets) * self.dice_weight
+        return dict(
+            loss_cls=loss_cls,
+            loss_mask=loss_mask)
+        '''
         _, _, b_h, b_w = mask_preds_x[0].shape
         for i in range(5):
-            #mask_preds[i] = F.sigmoid(F.upsample_bilinear(mask_preds[i], (b_h, b_w))).view(-1, b_h, b_w)
             mask_preds_x[i] = F.sigmoid(F.upsample_bilinear(mask_preds_x[i], (b_h, b_w))).view(-1, b_h, b_w)
             mask_preds_y[i] = F.sigmoid(F.upsample_bilinear(mask_preds_y[i], (b_h, b_w))).view(-1, b_h, b_w)
 
-        mask_preds_x = torch.cat([mask_pred_x for mask_pred_x in mask_preds_x], dim=0)
-        mask_preds_y = torch.cat([mask_pred_y for mask_pred_y in mask_preds_y], dim=0)
+        mask_preds = torch.cat([mask_pred for mask_pred in mask_preds], dim=0)
 
-        # TO CUDA
-        x_to_new = []
-        y_to_new = []
-        base = 0
-        for grid in self.grid_num:
-            single_x_new = torch.tensor([i for i in range(grid)]* grid).long() + base
-            single_y_new = torch.tensor([i for i in range(grid) for j in range(grid) ]).long() + base
-            x_to_new.append(single_x_new)
-            y_to_new.append(single_y_new)
-            base += grid
-        x_to_new = torch.cat(x_to_new).flatten()
-        y_to_new = torch.cat(y_to_new).flatten()
-
-        new_ind_x = torch.zeros(len(x_to_new)*num_imgs).long()
-        new_ind_y = torch.zeros(len(y_to_new)*num_imgs).long()
-        for i in range(num_imgs):
-            new_ind_x[i:i+len(x_to_new)] = x_to_new + sum(self.grid_num)*i
-            new_ind_y[i:i+len(y_to_new)] = y_to_new + sum(self.grid_num)*i
-
-        mask_preds = mask_preds_x[new_ind_x[pos_inds]].mul(mask_preds_y[new_ind_y[pos_inds]])
-
+        #decouple
+        mask_preds = mask_preds[pos_inds]
         pos_ins_inds = flatten_inds[pos_inds]
         pos_img_inds = img_inds[pos_inds]
         mask_target = torch.zeros((len(pos_inds), b_h, b_w)).to(mask_preds.device)
         for i in range(num_imgs):
             _, i_h, i_w = gt_masks[i].shape
-            gt_masks[i] = nn.ConstantPad2d((0, b_w * self.strides[i] - i_w, 0, b_h * self.strides[i] - i_h), 0)(
+            gt_masks[i] = nn.ConstantPad2d((0, b_w * self.strides[0] - i_w, 0, b_h * self.strides[0] - i_h), 0)(
                 torch.tensor(gt_masks[i])).to(mask_preds.device)
             gt_masks[i] = F.upsample_bilinear(gt_masks[i].float().unsqueeze(0), (b_h, b_w))[0]
             ind_this_img = torch.nonzero(pos_img_inds == i).flatten()
@@ -444,6 +460,7 @@ class DecoupledSoloHead2(nn.Module):
         return dict(
             loss_cls=loss_cls,
             loss_mask=loss_mask)
+        '''
 
     def get_bboxes_cpu(self, cls_scores, mask_preds, img_metas, cfg):
         flatten_cls_scores = torch.cat(
